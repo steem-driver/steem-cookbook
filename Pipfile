@@ -1,0 +1,30 @@
+[[source]]
+name = "pypi.douban"
+url = "https://pypi.douban.com/simple"
+verify_ssl = true
+
+[dev-packages]
+
+[packages]
+pandas = "*"
+invoke = "*"
+beem = "*"
+bs4 = "*"
+markdown = "*"
+unicodecsv = "*"
+lxml = "*"
+zmail = "*"
+requests = {extras = ["security"],version = "*"}
+certifi = "*"
+pymongo = {extras = ["tls"],version = "*"}
+dnspython = "*"
+langdetect = "*"
+matplotlib = "*"
+apscheduler = "*"
+steemengine = "*"
+goose3 = "*"
+newspaper3k = "*"
+scikit-learn = "*"
+
+[requires]
+python_version = "3.7"

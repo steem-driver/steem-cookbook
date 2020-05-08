@@ -1,0 +1,433 @@
+# -*- coding:utf-8 -*-
+
+import pandas as pd
+import traceback
+import json
+import types
+import time
+from datetime import datetime, timezone
+import pytz
+
+from beem.account import Account
+from beem.comment import Comment
+from beem.discussions import Query, Discussions_by_created, Comment_discussions_by_payout
+
+from steem.comment import SteemComment
+from steem.account import SteemAccount
+from steem.operation import SteemOperation
+from steem.stream import SteemStream
+from steem.scot import get_discussions
+from steem.settings import settings
+from utils.logging.logger import logger
+from utils.system.date import in_recent_days
+
+LIMIT_THRESHOLD = 100
+
+
+def query(q={}):
+    mode = q.get("mode", "post")
+    account = q.get("account", None)
+    tag = q.get("tag", None)
+    keyword = q.get("keyword", None)
+    limit = q.get("limit", None)
+    days = q.get("days", None)
+    receiver = q.get("receiver", None)
+    stream = q.get("stream", False)
+    token = q.get("token", None)
+    reblog = q.get("reblog", False)
+    pattern = q.get("pattern", None)
+
+    if mode == "vote":
+        return SteemPostsByVotes(account=account, days=days, pattern=pattern).read_posts()
+
+    if mode == "post":
+        return get_posts(account=account, tag=tag, keyword=keyword, limit=limit, days=days, stream=stream, token=token, reblog=reblog)
+    elif mode == "comment":
+        return get_comments(account=account, tag=tag, receiver=receiver, limit=limit, days=days, stream=stream)
+    elif "post" in mode and "comment" in mode:
+        return get_posts(account=account, tag=tag, keyword=keyword, limit=limit, days=days, stream=stream, token=token, reblog=reblog) + get_comments(account=account, tag=tag, receiver=receiver, limit=limit, days=days, stream=stream)
+    return []
+
+def get_posts(account=None, tag=None, keyword=None, limit=None, days=None, stream=False, token=None, reblog=False):
+    if stream:
+        return SteemPostsByStream(tag=tag, account=account, keyword=None, limit=limit, days=days, mode="post").read_posts()
+    elif token:
+        return SteemPostsByToken(token=token, tag=tag, keyword=keyword, limit=limit, days=days).read_posts()
+    elif account:
+        return SteemPostsByAccount(account=account, tag=tag, keyword=keyword, limit=limit, days=days, reblog=reblog).read_posts()
+    elif tag and not account:
+        return SteemPostsByTag(tag=tag, keyword=keyword, limit=limit, days=days).read_posts()
+
+def get_comments(account=None, tag=None, receiver=None, limit=None, days=None, stream=False):
+    if stream:
+        return SteemPostsByStream(tag=tag, account=account, keyword=None, limit=limit, days=days, mode="comment").read_posts()
+    elif account:
+        return SteemCommentsByAccount(account=account, receiver=receiver, limit=limit, days=days).read_comments()
+    elif tag and not account:
+        return SteemPostsByTag(tag=tag, keyword=None, limit=limit, days=days, mode="comment").read_posts()
+
+def in_recent_n_days(post, n, reblog=False):
+    key = "reblogged" if reblog else "created"
+    if isinstance(post[key], str):
+        created = datetime.strptime(post[key], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=pytz.UTC)
+    else:
+        created = post[key]
+    return in_recent_days(created, n)
+
+
+class SteemPostsByAccount:
+
+    def __init__(self, account, tag=None, keyword=None, limit=None, days=None, reblog=False):
+        self.username = account
+        try:
+            self.account = Account(account)
+            self.exists = True
+        except:
+            logger.info("account @{} doesn't exist".format(account))
+            self.exists = False
+        self.tag = tag
+        self.keyword = keyword # and keyword.decode('utf-8')
+        self.limit = int(limit) if limit else None
+        self.days = float(days) if days else None
+        self.reblog = reblog or False
+        self.total = None
+
+    def get_total(self):
+        if self.total is None:
+            self.total = len(self.account.get_blog()) # not correct
+        return self.total
+
+    def read_posts(self, start=0):
+        if not self.exists:
+            return []
+
+        c_list = {}
+        posts = []
+
+        if self.reblog:
+            blogs = self.account.history_reverse(only_ops=["custom_json"])
+        elif self.limit:
+            blogs = self.account.get_blog(start_entry_id=start, limit=self.limit)
+        else:
+            blogs = self.account.blog_history(start=start, limit=self.limit, reblogs=self.reblog)
+
+        days_done = False
+        for c in blogs:
+            if self.reblog:
+                if c['id'] == "follow":
+                    json_data = json.loads(c['json'])
+                    if len(json_data) > 0 and json_data[0] == "reblog":
+                        info = json_data[1]
+                        authorperm = "@{}/{}".format(info["author"], info["permlink"])
+                        timestamp = c["timestamp"]
+                        c = Comment(authorperm)
+                        c["reblogged"] = timestamp
+                    else:
+                        continue
+                else:
+                    continue
+            if c.authorperm in c_list:
+                continue
+            if not c.is_comment():
+                if ((not self.reblog) and c.author == self.username) or (self.reblog and c.author != self.username):
+                    sc = SteemComment(comment=c)
+                    tags = sc.get_tags()
+                    if self.tag is None or self.tag in tags:
+                        if self.keyword is None or self.keyword in c.title:
+                            days_done = self.days is not None and not in_recent_n_days(c, self.days, self.reblog)
+                            if days_done:
+                                break
+                            else:
+                                c = sc.refresh()
+                                sc.log()
+                                c_list[c.authorperm] = 1
+                                posts.append(c)
+
+        print ('{} posts are fetched'.format(len(posts)))
+        return posts
+
+class SteemPostsByTag:
+
+    def __init__(self, tag, keyword=None, limit=None, days=None, mode="post"):
+        self.tag = tag
+        self.keyword = keyword #and keyword.decode('utf-8')
+        self.limit = int(limit) if limit else None
+        self.days = float(days) if days else None
+        self.mode = mode or "post"
+
+    def read_posts(self):
+        posts = []
+        number_per_request = LIMIT_THRESHOLD - 1
+        index = 0
+        days_done = False
+
+        while True:
+            limit = min(self.limit - len(posts), number_per_request) if self.limit else number_per_request
+            if index > 0:
+                limit = limit + 1
+                last_post = new_posts[-1]
+            else:
+                last_post = None
+
+            res = self.read_posts_with_limit(limit, last_post)
+            new_posts = res["posts"]
+            days_done = res["days_done"]
+
+            # remove the head because it's the end of last request
+            if index > 0:
+                new_posts.pop(0)
+            if len(new_posts) > 0:
+                posts.extend(new_posts)
+            else:
+                break
+
+            # if time exceeds, stop
+            if days_done:
+                if settings.is_debug():
+                    print ('{} posts in {} days are fetched'.format(len(posts), self.days))
+                break
+
+            # if limit exceeds, stop
+            index += 1
+            if self.limit and self.limit <= len(posts):
+                if settings.is_debug():
+                    print ('{} posts of {} target posts are fetched'.format(len(posts), self.limit))
+                break
+
+        print ('{} posts are fetched'.format(len(posts)))
+        return posts
+
+    def read_posts_with_limit(self, limit, last_post=None):
+        posts = []
+
+        if last_post:
+            q = Query(limit=limit, tag=self.tag,
+                start_author=last_post.author,
+                start_permlink=last_post.permlink
+                # before_date=str(last_post['created'])
+                )
+        else:
+            q = Query(limit=limit, tag=self.tag)
+
+        if self.mode == "comment":
+            blogs = Comment_discussions_by_payout(q)
+        else:
+            blogs = Discussions_by_created(q)
+
+        if isinstance(blogs, types.GeneratorType):
+            logger.info("reading posts...")
+        else:
+            logger.info ('reading posts: {}'.format(len(blogs)))
+
+        c_list = {}
+        days_done = False
+        for c in blogs:
+            if c.permlink in c_list:
+                continue
+
+            if self.mode == "comment":
+                type_match = c.is_comment()
+            elif self.mode == "post":
+                type_match = not c.is_comment()
+            else: # self.mode == "all"
+                type_match = True
+
+            if type_match:
+                if self.keyword is None or self.keyword in c.title:
+                    days_done = self.days is not None and not in_recent_n_days(c, self.days)
+                    if days_done:
+                        break
+                    else:
+                        SteemComment(comment=c).log()
+                        c_list[c.permlink] = 1
+                        posts.append(c)
+        return {
+            "posts": posts,
+            "days_done": days_done
+        }
+
+
+class SteemPostsByToken(SteemPostsByTag):
+
+    def __init__(self, token, tag=None, keyword=None, limit=None, days=None, mode="token"):
+        super().__init__(tag, keyword, limit, days, mode)
+        self.token = token
+
+    def read_posts_with_limit(self, limit, last_post=None):
+        posts = []
+
+        if last_post:
+            blogs = get_discussions("created", token=self.token, limit=limit, start_author=last_post['author'], start_permlink=last_post['permlink'])
+        else:
+            blogs = get_discussions("created", token=self.token, limit=limit)
+
+        logger.info ('reading posts: {}'.format(len(blogs)))
+
+        c_list = {}
+        days_done = False
+        for ops in blogs:
+            c = SteemOperation(ops)
+            if ops['authorperm'] in c_list:
+                continue
+
+            tags = c.get_tags()
+            if self.tag is None or self.tag in tags:
+                if self.keyword is None or self.keyword in c.title():
+                    days_done = self.days is not None and not in_recent_n_days(ops, self.days)
+                    if days_done:
+                        break
+                    else:
+                        c.log(scot=True)
+                        c_list[ops['authorperm']] = 1
+                        posts.append(ops)
+        return {
+            "posts": posts,
+            "days_done": days_done
+        }
+
+
+class SteemCommentsByAccount:
+
+    def __init__(self, account, receiver=None, limit=None, days=None):
+        self.username = account
+        self.account = Account(account)
+        self.receiver = str(receiver) if receiver else None
+        self.limit = int(limit) if limit else None
+        self.days = float(days) if days else None
+        self.total = None
+
+    def read_comments(self):
+        c_list = {}
+        comments = []
+
+        comment_history = self.account.comment_history(limit=self.limit)
+
+        days_done = False
+        for c in comment_history:
+            if c.permlink in c_list:
+                continue
+            if c.is_comment() and c.author == self.username:
+                sc = SteemComment(comment=c)
+                days_done = self.days is not None and not in_recent_n_days(c, self.days)
+                if days_done:
+                    break
+                else:
+                    if self.receiver is None or len(self.receiver) == 0 \
+                        or c.parent_author == self.receiver:
+                        c = sc.refresh()
+                        sc.log()
+                        c_list[c.permlink] = 1
+                        comments.append(c)
+
+        print ('{} comments are fetched'.format(len(comments)))
+        return comments
+
+
+class SteemPostsByStream:
+
+    def __init__(self, tag, account=None, keyword=None, limit=None, days=None, mode="post"):
+        self.username = account
+        self.tag = tag
+        self.keyword = keyword #and keyword.decode('utf-8')
+        self.limit = int(limit) if limit else None
+        self.days = float(days) if days else None
+        self.mode = mode or "post"
+        self.stream = SteemStream(operations=["comment"])
+
+    def read_posts(self):
+        c_list = {}
+        posts = []
+
+        def filter_post(ops):
+            count = len(c_list.keys()) + 1
+            print ("operations: {}".format(count), end="\r", flush=True)
+
+            if ops['trx_id'] in c_list:
+                return
+
+            c_list[ops['trx_id']] = 1
+            c = SteemOperation(ops)
+
+            if self.mode == "comment":
+                type_match = c.is_comment()
+            elif self.mode == "post":
+                type_match = not c.is_comment()
+            else: # self.mode == "all"
+                type_match = True
+
+            if type_match:
+                tags = c.get_tags()
+                if self.tag is None or self.tag in tags:
+                    if self.username is None or c.author() == self.username:
+                        if self.keyword is None or self.keyword in c.title():
+                            # sc = SteemComment(ops=ops)
+                            c.log()
+                            posts.append(ops)
+
+        start = time.time()
+        self.stream.run(callback=filter_post, days=self.days)
+        elapsed = time.time() - start
+
+        print ("{} transactions are processed in {:.2f}s".format(len(c_list.keys()), elapsed))
+        print ('{} posts are fetched'.format(len(posts)))
+        return posts
+
+
+# alternative ways of fetching comments:
+# find every post in the tag, then get all replies for every post.
+# comments only take the first tag of the post as their own, other tags are ignored for the comments.
+
+
+class SteemPostsByVotes:
+
+    def __init__(self, account, days=None, pattern=None):
+        self.account = account
+        self.days = days
+        self.upvote = pattern
+
+    def get_votes(self, authors, up=None):
+        votes = []
+        for author in authors:
+            acc = SteemAccount(author=author)
+            my_votes = acc.get_votes(up)
+            for v in my_votes:
+                v['voter'] = author
+            votes += my_votes
+        return votes
+
+    def within_nth_day(self, post, n):
+        return post.get_comment().time_elapsed().total_seconds() / 60 / 60 / 24 < n
+
+    def read_posts(self):
+        posts = {}
+        votes = self.get_votes(self.account, up=self.upvote)
+        for v in votes:
+            # filter votes with 7 days
+            # dt = datetime.strptime(v['time'], "%Y-%m-%dT%H:%M:%S")
+            dt = datetime.strptime(v['last_update'], "%Y-%m-%dT%H:%M:%S")
+            dt = dt.replace(tzinfo=timezone.utc)
+            if not in_recent_days(dt, self.days):
+                continue
+
+            # get post data
+            # authorperm = v['authorperm']
+            authorperm = "@{}/{}".format(v['author'], v['permlink'])
+            if not authorperm in posts:
+                c = SteemComment(author_perm=authorperm)
+                if not self.within_nth_day(c, self.days):
+                    continue
+                posts[authorperm] = {
+                    "author": c.get_comment().author,
+                    "permlink": v['permlink'],
+                    "authorperm": authorperm,
+                    "voters": [],
+                    "percents": [],
+                    "created": c.get_comment()['created']
+                }
+            # get voters and percentage
+            posts[authorperm]['voters'].append(v['voter'])
+            # posts[authorperm]['percents'].append(v['percent'])
+            posts[authorperm]['percents'].append(v['vote_percent'])
+        res = list(posts.values())
+        res.sort(key=lambda post: post['created'])
+        return res
